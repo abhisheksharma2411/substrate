@@ -1630,7 +1630,7 @@ func toAteomWakeupProbe(in *ateletpb.WakeupProbe) *ateompb.WakeupProbe {
 	}
 	out := &ateompb.WakeupProbe{}
 	if hg := in.GetHttpGet(); hg != nil {
-		out.HttpGet = &ateompb.HTTPGetAction{
+		out.HttpGet = &ateompb.HttpGetAction{
 			Path: hg.GetPath(),
 			Port: hg.GetPort(),
 		}
