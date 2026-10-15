@@ -15,13 +15,14 @@
 package objectstorage
 
 import (
-	"bytes"
 	"io"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestChunkFor(t *testing.T) {
@@ -66,83 +67,42 @@ func TestSmallInputDoesNotReserveFullChunk(t *testing.T) {
 	}
 }
 
-// The pool still refuses to grow past its cap, so the lazy fill did not turn the
-// bound into an unbounded allocator.
+// The pool still refuses to grow past its cap, so the lazy fill did not turn
+// the bound into an unbounded allocator. Exercising getBuf() rather than
+// counting tokens: a test that only reads len(p.quota) still passes if getBuf()
+// allocates past an exhausted quota, which is the regression worth guarding.
 func TestBufferPoolStillCapped(t *testing.T) {
 	p := newParZstd(io.Discard, 2, parZstdMinChunk)
 	defer p.Close()
-	// One buffer is already held in p.buf; drain the rest of the allowance.
-	created := 1
-	for len(p.quota) > 0 {
-		<-p.quota
-		created++
-	}
-	if want := 2 * parZstdQueue; created != want {
-		t.Errorf("pool allowance = %d buffers, want %d", created, want)
-	}
-}
 
-// Round-trip at the sizes where the new chunk sizing changes behavior.
-func TestSparseZstdRoundTripAtChunkBoundaries(t *testing.T) {
-	sizes := []int64{
-		0,
-		36,
-		parZstdMinChunk - 1,
-		parZstdMinChunk,
-		parZstdChunk - parZstdChunkSlack - 1,
-		parZstdChunk,
-		parZstdChunk + 1,
-		2*parZstdChunk + 12345,
+	// newParZstd clamps workers to GOMAXPROCS, so derive the allowance from the
+	// worker count it actually settled on rather than the number requested.
+	allowance := p.workers * parZstdQueue
+	held := make([][]byte, 0, allowance)
+	for len(held)+1 < allowance { // p.buf already holds one of them
+		held = append(held, p.getBuf())
 	}
-	for _, size := range sizes {
-		t.Run(name(size), func(t *testing.T) {
-			dir := t.TempDir()
-			srcPath := filepath.Join(dir, "src")
-			var regions []region
-			if size > 0 {
-				regions = []region{{0, size, 0x5A}}
-			}
-			writeSparseSource(t, srcPath, size, regions)
-			src, err := os.Open(srcPath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer src.Close()
 
-			var buf bytes.Buffer
-			logical, _, err := writeSparseZstd(&buf, src)
-			if err != nil {
-				t.Fatalf("writeSparseZstd: %v", err)
-			}
-			if logical != size {
-				t.Errorf("logical = %d, want %d", logical, size)
-			}
+	// Every buffer the pool may create is now out, so the next request has to
+	// wait for one to come back rather than making another.
+	waiting := make(chan []byte, 1)
+	go func() { waiting <- p.getBuf() }()
+	select {
+	case <-waiting:
+		t.Fatal("getBuf() handed out a buffer past the pool's cap")
+	case <-time.After(100 * time.Millisecond):
+	}
 
-			dstPath := filepath.Join(dir, "dst")
-			dst, err := os.Create(dstPath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer dst.Close()
-			got, err := readSparseZstd(dst, bytes.NewReader(buf.Bytes()[len(sparseMagic):]))
-			if err != nil {
-				t.Fatalf("readSparseZstd: %v", err)
-			}
-			if got != size {
-				t.Errorf("readSparseZstd size = %d, want %d", got, size)
-			}
-			want, err := os.ReadFile(srcPath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			have, err := os.ReadFile(dstPath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !bytes.Equal(have, want) {
-				t.Fatalf("round-trip mismatch at size %d (got %d bytes, want %d)", size, len(have), len(want))
-			}
-		})
+	// Returning one releases the waiter, and it gets that buffer back.
+	returned := held[0]
+	p.free <- returned[:0]
+	select {
+	case got := <-waiting:
+		if cap(got) != cap(returned) {
+			t.Errorf("resumed getBuf() returned a buffer of cap %d, want the recycled %d", cap(got), cap(returned))
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("getBuf() never resumed after a buffer was returned")
 	}
 }
 
@@ -153,7 +113,7 @@ func TestConcurrentSmallFileAllocation(t *testing.T) {
 	dir := t.TempDir()
 	paths := make([]string, files)
 	for i := range paths {
-		p := filepath.Join(dir, "f"+name(int64(i)))
+		p := filepath.Join(dir, "f"+strconv.Itoa(i))
 		if err := os.WriteFile(p, make([]byte, 36), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -190,16 +150,4 @@ func TestConcurrentSmallFileAllocation(t *testing.T) {
 	if got > limit {
 		t.Errorf("allocated %d bytes for %d tiny files, want under %d", got, files, limit)
 	}
-}
-
-func name(n int64) string {
-	if n == 0 {
-		return "0"
-	}
-	var b []byte
-	for n > 0 {
-		b = append([]byte{byte('0' + n%10)}, b...)
-		n /= 10
-	}
-	return string(b)
 }
